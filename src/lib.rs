@@ -14,6 +14,8 @@ It is intended to be used by crates such as [owning_ref](https://crates.io/crate
 no_std support can be enabled by disabling default features (specifically "std"). In this case, the trait will not be implemented for the std types mentioned above, but you can still use it for your own types.
 */
 
+#![feature(vec_into_raw_parts)]
+#![allow(unused_parens, unused_imports)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(feature = "std")]
@@ -119,7 +121,51 @@ Foo cannot implement StableDeref because deref and deref_mut return different ad
 
 
 */
-pub unsafe trait StableDeref: Deref {}
+
+pub unsafe trait BubbleWrap: Sized {
+    type BubbleWrappedRaw;
+    unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw;
+    unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self;
+}
+
+#[macro_export]
+macro_rules! noop_bubble_wrap {
+    () => {
+        type BubbleWrappedRaw = Self;
+        unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw { this }
+        unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self { bw }
+    }
+}
+
+#[macro_export]
+macro_rules! todo_bubble_wrap {
+    () => {
+        type BubbleWrappedRaw = Self;
+        unsafe fn into_bubble_wrap(_: Self) -> Self::BubbleWrappedRaw { unimplemented!() }
+        unsafe fn from_bubble_wrap(_: Self::BubbleWrappedRaw) -> Self { unimplemented!() }
+    }
+}
+
+#[repr(transparent)]
+pub struct BubbleWrapped<T: BubbleWrap>(T::BubbleWrappedRaw);
+
+impl<T: BubbleWrap> BubbleWrapped<T> {
+    pub fn new(t: T) -> Self { unsafe { BubbleWrapped(T::into_bubble_wrap(t)) } }
+    pub fn unwrap(self) -> T { unsafe { T::from_bubble_wrap(self.0) } }
+}
+impl<T: BubbleWrap> std::ops::Deref for BubbleWrapped<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*(self as *const _ as *const _) }
+    }
+}
+impl<T: BubbleWrap> std::ops::DerefMut for BubbleWrapped<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *(self as *mut _ as *mut _) }
+    }
+}
+
+pub unsafe trait StableDeref: Deref + BubbleWrap {}
 
 /**
 An unsafe marker trait for types where clones deref to the same address. This has all the requirements of StableDeref, and additionally requires that after calling clone(), both the old and new value deref to the same address. For example, Rc and Arc implement CloneStableDeref, but Box and Vec do not.
@@ -151,30 +197,73 @@ use core::cell::{Ref, RefMut};
 
 
 #[cfg(feature = "alloc")]
+unsafe impl<T: ?Sized> BubbleWrap for Box<T> {
+    type BubbleWrappedRaw = *mut T;
+    unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw { Box::into_raw(this) }
+    unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self { Box::from_raw(bw) }
+}
+#[cfg(feature = "alloc")]
 unsafe impl<T: ?Sized> StableDeref for Box<T> {}
+
+#[cfg(feature = "alloc")]
+unsafe impl<T> BubbleWrap for Vec<T> {
+    // /!\ we need equal layout, so this is not guaranteed to work:
+    type BubbleWrappedRaw = (*mut T, usize, usize);
+    unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw {
+        Vec::into_raw_parts(this)
+    }
+    unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self {
+        Vec::from_raw_parts(bw.0, bw.1, bw.2)
+    }
+}
 #[cfg(feature = "alloc")]
 unsafe impl<T> StableDeref for Vec<T> {}
+
+#[cfg(feature = "alloc")]
+unsafe impl BubbleWrap for String {
+    type BubbleWrappedRaw = <Vec<u8> as BubbleWrap>::BubbleWrappedRaw;
+    unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw { Vec::into_bubble_wrap(this.into_bytes()) }
+    unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self { String::from_utf8_unchecked(Vec::<u8>::from_bubble_wrap(bw)) }
+}
 #[cfg(feature = "alloc")]
 unsafe impl StableDeref for String {}
 
+#[cfg(feature = "alloc")]
+unsafe impl<T: ?Sized> BubbleWrap for Rc<T> { noop_bubble_wrap!(); }
 #[cfg(feature = "alloc")]
 unsafe impl<T: ?Sized> StableDeref for Rc<T> {}
 #[cfg(feature = "alloc")]
 unsafe impl<T: ?Sized> CloneStableDeref for Rc<T> {}
 #[cfg(feature = "alloc")]
+unsafe impl<T: ?Sized> BubbleWrap for Arc<T> { noop_bubble_wrap!(); }
+#[cfg(feature = "alloc")]
 unsafe impl<T: ?Sized> StableDeref for Arc<T> {}
 #[cfg(feature = "alloc")]
 unsafe impl<T: ?Sized> CloneStableDeref for Arc<T> {}
 
+unsafe impl<'a, T: ?Sized> BubbleWrap for Ref<'a, T> { noop_bubble_wrap!(); }
 unsafe impl<'a, T: ?Sized> StableDeref for Ref<'a, T> {}
+unsafe impl<'a, T: ?Sized> BubbleWrap for RefMut<'a, T> { todo_bubble_wrap!(); }
 unsafe impl<'a, T: ?Sized> StableDeref for RefMut<'a, T> {}
+#[cfg(feature = "std")]
+unsafe impl<'a, T: ?Sized> BubbleWrap for MutexGuard<'a, T> { todo_bubble_wrap!(); }
 #[cfg(feature = "std")]
 unsafe impl<'a, T: ?Sized> StableDeref for MutexGuard<'a, T> {}
 #[cfg(feature = "std")]
+unsafe impl<'a, T: ?Sized> BubbleWrap for RwLockReadGuard<'a, T> { noop_bubble_wrap!(); }
+#[cfg(feature = "std")]
 unsafe impl<'a, T: ?Sized> StableDeref for RwLockReadGuard<'a, T> {}
+#[cfg(feature = "std")]
+unsafe impl<'a, T: ?Sized> BubbleWrap for RwLockWriteGuard<'a, T> { todo_bubble_wrap!(); }
 #[cfg(feature = "std")]
 unsafe impl<'a, T: ?Sized> StableDeref for RwLockWriteGuard<'a, T> {}
 
+unsafe impl<'a, T: ?Sized> BubbleWrap for &'a T { noop_bubble_wrap!(); }
 unsafe impl<'a, T: ?Sized> StableDeref for &'a T {}
 unsafe impl<'a, T: ?Sized> CloneStableDeref for &'a T {}
+unsafe impl<'a, T: ?Sized> BubbleWrap for &'a mut T {
+    type BubbleWrappedRaw = *mut T;
+    unsafe fn into_bubble_wrap(this: Self) -> Self::BubbleWrappedRaw { this as *mut T }
+    unsafe fn from_bubble_wrap(bw: Self::BubbleWrappedRaw) -> Self { &mut *bw }
+}
 unsafe impl<'a, T: ?Sized> StableDeref for &'a mut T {}
